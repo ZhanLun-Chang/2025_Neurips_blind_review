@@ -476,39 +476,6 @@ if __name__ == "__main__":
         type_training_dataset_dict = get_dataset_dict(args, train=True)
         type_testing_dataset_dict = get_dataset_dict(args, train=False)
 
-    # if args.dataset_name == "ag_news":
-
-    #     if args.label_distribution == "half":
-    #         clients_data_ids, client_classes = distinct_half_agnews(type_training_dataset_dict[args.dataset_name], args.num_clients)
-
-    #     elif args.label_distribution == "partial_overlap":
-
-    #         clients_data_ids, client_classes = distribute_agnews_labels_specific(type_training_dataset_dict[args.dataset_name], total_clients= args.num_clients)
-        
-    #     elif args.label_distribution == "distinct":
-    #         clients_data_ids, client_classes = distribute_agnews_exclusive_quarters(type_training_dataset_dict[args.dataset_name], args.num_clients)
-
-    #     elif args.label_distribution == "two_shard":
-    #         clients_data_ids, client_classes = pathological_non_iid_partition(type_training_dataset_dict[args.dataset_name], args.num_clients)
-
-
-    # elif args.label_distribution == "half":
-    #     clients_data_ids, client_classes = distinct_half(type_training_dataset_dict[args.dataset_name], args.num_clients)
-
-    # elif args.label_distribution == "distinct":
-    #     clients_data_ids, client_classes = distinct_class_each_device(type_training_dataset_dict[args.dataset_name])
-    
-    # elif args.label_distribution == "two_shard":
-
-    #     clients_data_ids, client_classes = distribute_labels_in_batches(type_training_dataset_dict[args.dataset_name], args.num_clients)
-    
-    # elif args.label_distribution == "partial_overlap":
-
-    #     clients_data_ids, client_classes = distribute_labels_slight_overlap_clients(type_training_dataset_dict[args.dataset_name], total_clients= args.num_clients)
-
-    # else:
-    #     raise ValueError("Wrong values to class distribution!")
-
     clients_data_ids, client_classes, session_clients, training_order = partition_and_schedule(
     dataset = type_training_dataset_dict[args.dataset_name],
     num_clients_per_group = num_clients,
@@ -519,7 +486,6 @@ if __name__ == "__main__":
     cross_session_label_overlap = args.cross_session_label_overlap,
     in_session_label_dist = args.in_session_label_dist,
     dirichlet_alpha = args.dirichlet_alpha,
-    shards_per_client = 2,
     unbalanced_sgm = 0.0,
     )
     

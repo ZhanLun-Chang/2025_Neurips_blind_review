@@ -1847,16 +1847,15 @@ def partition_and_schedule(
     num_sessions_pilot: int,
     num_rounds_pilot: int,
     num_rounds_actual: int,
-    cross_session_label_overlap: float, 
-    in_session_label_dist: str,       
+    cross_session_label_overlap: float,
+    in_session_label_dist: str,
     dirichlet_alpha: float = 0.5,
-    shards_per_client: int = 2,
     unbalanced_sgm: float = 0.0
 ):
     """
     Partitions a dataset for federated learning into two client-groups (A, B),
     splits the label space into two subsets (with optional overlap between groups for different sessions),
-    allocates samples to clients within a session/group based on the specified distribution method, and builds:
+    allocates samples to clients within a session/group based on a Dirichlet distribution, and builds:
       • `session_clients`: list of length `num_sessions`, alternating A/B.
       • `training_order`: fully expanded per-round schedule.
 
@@ -1880,40 +1879,17 @@ def partition_and_schedule(
             labels2 (for Group B) = overl + uniq2
       Unused labels remain unassigned.
 
-    In-session label distribution methods (`in_session_label_dist`):
-      (Determines how samples of the group-specific labels are distributed among clients *within* that group)
+    In-session label distribution (`in_session_label_dist`):
       - "dirichlet":
-          For each client group (A or B) and its assigned set of labels:
-            1. Determine total samples per client: The total number of data samples
-               available for the group's labels is distributed among the clients in
-               that group. If `unbalanced_sgm > 0`, this distribution is drawn
-               from a log-normal distribution (controlled by `unbalanced_sgm` as sigma),
-               ensuring some clients get more data than others. Otherwise, data is
-               distributed as evenly as possible. This determines each client's "quota".
-            2. Client-specific class proportions: For each client, a set of proportions
-               for the labels in its group's label set is drawn from a
-               Dirichlet distribution (parameterized by `dirichlet_alpha`).
-            3. Sample assignment: Samples are assigned to clients iteratively. For each
-               sample slot in a client's quota, a class is chosen based on the
-               client's Dirichlet-generated class proportions. If samples of that
-               class are available in the (shuffled) pool for the group's labels,
-               one is assigned. If prior-based selection fails after several attempts
-               (e.g., preferred classes are exhausted), a fallback mechanism assigns
-               a sample from any other available class in the group to fill the slot.
-               This continues until client quotas are met or data runs out for the group.
-      - "two_shards":
-          For each label-group:
-            • total_shards = shards_per_client * group_size
-            • shards_per_label = floor(total_shards / num_labels)
-            • For each label: split its indices into `shards_per_label` shards
-              of size floor(len(idxs)/shards_per_label), leave remainder unused.
-            • Pool all shards, shuffle, then for each client draw
-              `shards_per_client` shards without replacement.
-            • Each client hence gets at most `shards_per_client` labels.
+          1. Determine per-client quotas: distribute total samples among clients
+             (balanced or log-normal if `unbalanced_sgm > 0`).
+          2. For each client, draw class proportions from Dirichlet(`dirichlet_alpha`).
+          3. Assign samples by inverse‐CDF sampling on those priors, falling back
+             to any remaining class when necessary.
 
     Args:
         dataset:
-            Any dataset with integer labels accessible as described in `_extract_targets`.
+            Any dataset with integer labels accessible via `_extract_targets`.
         num_clients_per_group (int):
             Clients per group; total federated clients = 2 * this value.
         num_sessions (int):
@@ -1925,28 +1901,23 @@ def partition_and_schedule(
         num_rounds_actual (int):
             Rounds per session in the actual phase.
         cross_session_label_overlap (float):
-            Fraction of label overlap between Group A's label set and Group B's label set.
-            If 0: disjoint label halves; if in (0,1): attempt that fraction overlap.
+            Fraction of label overlap between Group A's label set and Group B's.
         in_session_label_dist (str):
-            Method for distributing samples of group-specific labels to clients within that group.
-            Options: "dirichlet" or "two_shards".
+            Method for distributing samples; only "dirichlet" is supported.
         dirichlet_alpha (float):
-            α parameter for Dirichlet when `in_session_label_dist` is "dirichlet".
-        shards_per_client (int):
-            # of shards per client when `in_session_label_dist` is "two_shards".
+            α parameter for the Dirichlet distribution.
         unbalanced_sgm (float):
-            Sigma for log-normal distribution of samples per client when `in_session_label_dist`
-            is "dirichlet". If 0, samples are distributed as evenly as possible.
+            Sigma for log-normal quotas when using Dirichlet. If 0, quotas are balanced.
 
     Returns:
         clients_data_ids (dict[int, list[int]]):
-            client_id → assigned sample indices.
+            Mapping from client_id to assigned sample indices.
         client_classes (dict[int, set[int]]):
-            client_id → set of labels held.
+            Mapping from client_id to its set of labels.
         session_clients (list[list[int]]):
-            length = num_sessions; client-group per session.
+            Length = num_sessions; each entry is the client group for that session.
         training_order (list[list[int]]):
-            per-round client IDs; total rounds =
+            Per-round client IDs; total rounds =
             num_sessions_pilot*num_rounds_pilot +
             (num_sessions-num_sessions_pilot)*num_rounds_actual
 
@@ -1955,347 +1926,149 @@ def partition_and_schedule(
           - If `num_clients_per_group < 1`.
           - If `num_sessions_pilot > num_sessions`.
           - If `cross_session_label_overlap` not in [0,1).
-          - If `in_session_label_dist` invalid.
+          - If `in_session_label_dist` is not "dirichlet".
+          - If `unbalanced_sgm` is negative.
     """
     # --- Argument Validation ---
-    # Ensure the number of clients per group is at least 1.
     if num_clients_per_group < 1:
         raise ValueError("num_clients_per_group must be ≥ 1.")
-    # Ensure pilot sessions do not exceed total sessions.
     if num_sessions_pilot > num_sessions:
         raise ValueError("num_sessions_pilot cannot exceed num_sessions.")
-    # Ensure overlap fraction is within the valid range [0, 1).
     if not (0 <= cross_session_label_overlap < 1):
         raise ValueError("cross_session_label_overlap must be in [0,1).")
-    # Ensure a valid allocation method is specified.
-    if in_session_label_dist not in ("dirichlet", "two_shards"):
-        raise ValueError("in_session_label_dist must be 'dirichlet' or 'two_shards'.")
-    # Ensure sigma for log-normal distribution is non-negative.
+    # Only Dirichlet allocation is supported now
+    if in_session_label_dist not in ("dirichlet",):
+        raise ValueError("in_session_label_dist must be 'dirichlet'.")
     if unbalanced_sgm < 0:
         raise ValueError("unbalanced_sgm must be non-negative.")
 
     # --- 1. Extract Labels from Dataset ---
-    targets = _extract_targets(dataset) # Extract all target labels using the helper function.
-    unique_labels = np.unique(targets)  # Get the sorted list of unique labels present in the dataset.
-    L = unique_labels.size              # Total number of unique classes in the dataset (L).
+    targets = _extract_targets(dataset)
+    unique_labels = np.unique(targets)
+    L = unique_labels.size
 
     # --- 2. Define Client Groups ---
-    total_clients = 2 * num_clients_per_group # Calculate the total number of clients.
-    clients = list(range(total_clients))      # Create a list of client IDs (0 to total_clients - 1).
-    groupA = clients[:num_clients_per_group]  # Assign the first half of clients to Group A.
-    groupB = clients[num_clients_per_group:]  # Assign the second half of clients to Group B.
+    total_clients = 2 * num_clients_per_group
+    clients = list(range(total_clients))
+    groupA = clients[:num_clients_per_group]
+    groupB = clients[num_clients_per_group:]
 
     # --- 3. Split Labels for Group A and Group B ---
-    # This section determines which labels are primarily associated with Group A and Group B across different sessions.
-    # The `cross_session_label_overlap` parameter controls how many labels are shared between these two primary sets.
-    if L == 0: # Handle the case of an empty dataset (no labels).
-        labels1 = [] # Labels for Group A will be empty.
-        labels2 = [] # Labels for Group B will be empty.
-    elif cross_session_label_overlap == 0: # No overlap: Split labels into two disjoint halves.
-        half = L // 2 # Integer division to find the midpoint.
-        labels1 = unique_labels[:half].tolist() # Group A gets the first half of unique labels.
-        labels2 = unique_labels[half:].tolist() # Group B gets the second half.
-    else: # Calculate overlapping label sets based on `cross_session_label_overlap`.
-        # G: Effective size of a single group's label pool if labels were distributed to fill (2 - overlap_fraction) conceptual slots.
-        # O: Number of overlapping labels between the two groups.
-        denominator = (2 - cross_session_label_overlap)
-        if denominator == 0: G = L # Should ideally not happen due to overlap_fraction < 1.
-        else: G = int(np.floor(L / denominator))
+    if L == 0:
+        labels1, labels2 = [], []
+    elif cross_session_label_overlap == 0:
+        half = L // 2
+        labels1 = unique_labels[:half].tolist()
+        labels2 = unique_labels[half:].tolist()
+    else:
+        denom = (2 - cross_session_label_overlap)
+        G = int(np.floor(L / denom)) if denom != 0 else L
         O = int(np.floor(G * cross_session_label_overlap))
-
-        # If calculated overlap (O) is 0, or group size (G) is 0, or overlap is greater than or equal to group size,
-        # it's not a valid overlap scenario as defined. Fallback to a simple disjoint split.
-        if O == 0 or G == 0 or G <= O : 
+        if O == 0 or G == 0 or G <= O:
             half = L // 2
             labels1 = unique_labels[:half].tolist()
             labels2 = unique_labels[half:].tolist()
         else:
-            U = G - O # Number of unique (non-overlapping) labels for each group's initial part.
-            
-            # Define slices for unique and overlapping parts, ensuring indices are within bounds of `unique_labels`.
-            uniq1_end = U
-            overl_start = U
-            overl_end = U + O
-            uniq2_start = U + O 
-            uniq2_end = U + O + U 
+            U = G - O
+            uniq1 = unique_labels[:U]
+            overl = unique_labels[U:U+O]
+            uniq2 = unique_labels[U+O:U+O+U]
+            labels1 = sorted(set(uniq1.tolist() + overl.tolist()))
+            labels2 = sorted(set(overl.tolist() + uniq2.tolist()))
 
-            # Extract label arrays for unique parts and the overlapping part.
-            uniq1_labels = unique_labels[:min(uniq1_end, L)]
-            overl_labels = unique_labels[min(overl_start, L):min(overl_end, L)]
-            uniq2_labels = unique_labels[min(uniq2_start, L):min(uniq2_end, L)] # These are unique to the "second" conceptual group.
-            
-            # Construct label sets for Group A (labels1) and Group B (labels2).
-            labels1_list = []
-            if uniq1_labels.size > 0: labels1_list.extend(uniq1_labels.tolist())
-            if overl_labels.size > 0: labels1_list.extend(overl_labels.tolist())
-            
-            labels2_list = []
-            if overl_labels.size > 0: labels2_list.extend(overl_labels.tolist()) 
-            if uniq2_labels.size > 0: labels2_list.extend(uniq2_labels.tolist())
-            
-            # Ensure labels are unique within each list (in case of edge conditions in slicing) and sorted.
-            labels1 = sorted(list(set(labels1_list)))
-            labels2 = sorted(list(set(labels2_list)))
-    
-    # Debug print to show the resulting label sets for each group.
     print(f"[DEBUG] Labels for Group A (labels1): {labels1} (Count: {len(labels1)})")
     print(f"[DEBUG] Labels for Group B (labels2): {labels2} (Count: {len(labels2)})")
 
+    # --- 4. Allocate Data Samples to Clients via Dirichlet ---
+    clients_data_ids = {cid: [] for cid in clients}
+    client_classes   = {cid: set() for cid in clients}
 
-    # --- 4. Allocate Data Samples to Clients ---
-    # Initialize dictionaries to store data sample indices and class sets for each client.
-    clients_data_ids = {cid: [] for cid in clients} # Maps client_id to a list of sample_indices.
-    client_classes   = {cid: set() for cid in clients}  # Maps client_id to a set of labels they hold.
-
-    # --- Method 1: Dirichlet-based distribution ---
     if in_session_label_dist == "dirichlet":
-        # This loop processes Group A with labels1, then Group B with labels2.
         for lbls_for_group, grp_client_ids in ((labels1, groupA), (labels2, groupB)):
             num_clients_in_grp = len(grp_client_ids)
-            # Skip if the current group is empty or has no labels assigned to it.
-            if num_clients_in_grp == 0 or not lbls_for_group: 
+            if num_clients_in_grp == 0 or not lbls_for_group:
                 continue
 
-            # Collect all sample indices for the labels assigned to this current group.
-            group_label_indices = {} # Maps label -> list of sample_indices for that label within this group.
+            group_label_indices = {}
             total_samples_for_group_labels = 0
             for lbl in lbls_for_group:
-                idxs = np.where(targets == lbl)[0] # Find all samples in the entire dataset with the current label.
+                idxs = np.where(targets == lbl)[0]
                 group_label_indices[lbl] = idxs
                 total_samples_for_group_labels += len(idxs)
-            
-            # If no samples exist for any of the group's assigned labels, skip processing this group.
+
             if total_samples_for_group_labels == 0:
-                continue 
-
-            # --- 4.1. Determine client quotas (target number of samples per client in this group) ---
-            client_target_quotas_list = np.zeros(num_clients_in_grp, dtype=int) # Initialize quotas to zero.
-            if total_samples_for_group_labels > 0 : # Proceed only if there's data to distribute.
-                avg_samples_per_client_in_grp = total_samples_for_group_labels / num_clients_in_grp
-                
-                # If unbalanced distribution is requested (`unbalanced_sgm > 0`) and possible.
-                if unbalanced_sgm > 0 and num_clients_in_grp > 0: 
-                    # Use log-normal distribution to create varying quotas for clients.
-                    # `mu` is the mean of the underlying normal distribution for the log-normal.
-                    mu = np.log(avg_samples_per_client_in_grp) if avg_samples_per_client_in_grp > 1e-9 else -10 # Avoid log(0).
-                    quotas_raw = np.random.lognormal(mean=mu, sigma=unbalanced_sgm, size=num_clients_in_grp)
-                    
-                    sum_quotas_raw = np.sum(quotas_raw)
-                    if sum_quotas_raw > 1e-9: # Avoid division by zero.
-                        # Normalize raw quotas so their sum matches the total available samples for the group.
-                        client_target_quotas_list_float = (quotas_raw / sum_quotas_raw) * total_samples_for_group_labels
-                    else: # Fallback if lognormal gives all zeros (e.g., due to extreme sigma).
-                        client_target_quotas_list_float = np.full(num_clients_in_grp, avg_samples_per_client_in_grp)
-                else: # Balanced distribution: each client gets roughly an equal number of samples.
-                    client_target_quotas_list_float = np.full(num_clients_in_grp, avg_samples_per_client_in_grp)
-
-                client_target_quotas_list = client_target_quotas_list_float.astype(int) # Convert float quotas to integer counts.
-                
-                # Adjust for rounding errors to ensure the sum of integer quotas matches total available samples.
-                current_sum_quotas = np.sum(client_target_quotas_list)
-                diff_sum = total_samples_for_group_labels - current_sum_quotas
-                
-                if diff_sum != 0: # If there's a difference due to rounding.
-                    # Distribute the remainder (or deficit) one by one among clients cyclically.
-                    for i in range(int(abs(diff_sum))):
-                        client_target_quotas_list[i % num_clients_in_grp] += np.sign(diff_sum)
-                
-                client_target_quotas_list = np.maximum(0, client_target_quotas_list) # Ensure no client has a negative quota.
-                
-                # Final check and correction if the sum is still off (e.g., if all quotas became 0 then diff_sum was positive).
-                final_sum_check = np.sum(client_target_quotas_list)
-                if final_sum_check != total_samples_for_group_labels:
-                    if final_sum_check == 0 and total_samples_for_group_labels > 0:
-                        # If all quotas are zero but samples exist, distribute them (e.g., to the first few clients).
-                        temp_total_to_distribute = total_samples_for_group_labels
-                        for i in range(num_clients_in_grp):
-                            can_take = temp_total_to_distribute 
-                            client_target_quotas_list[i] = can_take
-                            temp_total_to_distribute -= can_take
-                            if temp_total_to_distribute == 0: break
-                    elif final_sum_check > 0 : # If sum is non-zero but still off, perform one more adjustment pass.
-                        diff_again = total_samples_for_group_labels - final_sum_check
-                        for i in range(int(abs(diff_again))):
-                             client_target_quotas_list[i % num_clients_in_grp] += np.sign(diff_again)
-                        client_target_quotas_list = np.maximum(0, client_target_quotas_list)
-
-            # --- 4.2. Client-specific Class Priors (Proportions for labels in lbls_for_group) ---
-            client_prior_cumsum_map = {} # Stores cumulative sum of Dirichlet-generated priors for each client.
-            if lbls_for_group: # Only if there are labels to distribute for this group.
-                for cid in grp_client_ids:
-                    # Each client gets its own set of label proportions drawn from a Dirichlet distribution.
-                    # `dirichlet_alpha` controls the uniformity of these proportions.
-                    priors = np.random.dirichlet(alpha=[dirichlet_alpha] * len(lbls_for_group))
-                    client_prior_cumsum_map[cid] = np.cumsum(priors) # Store cumulative sum for efficient sampling later.
-            
-            # --- 4.3. Create Data Pools (available samples for each label in the group, shuffled) ---
-            # `indices_by_label_pool` maps each label to a list of its available sample indices.
-            indices_by_label_pool = {lbl: list(group_label_indices[lbl]) for lbl in lbls_for_group}
-            for lbl in indices_by_label_pool:
-                np.random.shuffle(indices_by_label_pool[lbl]) # Shuffle samples within each label's pool for randomness.
-            
-            # `samples_left_in_label_pool` tracks the count of remaining samples for each label.
-            samples_left_in_label_pool = {lbl: len(indices_by_label_pool[lbl]) for lbl in lbls_for_group}
-
-            # --- 4.4. Iterative Sample Assignment to clients in the current group ---
-            for client_grp_idx, current_client_id in enumerate(grp_client_ids):
-                num_samples_this_client_needs = client_target_quotas_list[client_grp_idx] # Get the quota for this client.
-                
-                # Skip if client needs 0 samples, or no labels/priors defined for the group.
-                if num_samples_this_client_needs == 0 or not lbls_for_group or not client_prior_cumsum_map:
-                    continue
-                
-                client_specific_prior_cumsum = client_prior_cumsum_map[current_client_id] # Get client's label preferences.
-
-                # Fill the client's quota slot by slot.
-                for _slot_idx in range(num_samples_this_client_needs):
-                    # If no data is left in any label pool for this group, stop assigning to this client.
-                    if sum(samples_left_in_label_pool.values()) == 0:
-                        break 
-
-                    assigned_this_slot = False
-                    # Try to pick a class based on the client's Dirichlet priors (with multiple attempts).
-                    # Max attempts is a heuristic to give a fair chance for prior-based selection.
-                    for _attempt in range(len(lbls_for_group) * 3 + 5): 
-                        u_draw = np.random.uniform() # Random draw for inverse transform sampling.
-                        # Select a label based on the client's prior distribution using the cumulative sum.
-                        chosen_label_idx_in_lbls = np.argmax(u_draw <= client_specific_prior_cumsum)
-                        chosen_label = lbls_for_group[chosen_label_idx_in_lbls]
-
-                        # If samples of the chosen label are available, assign one.
-                        if samples_left_in_label_pool[chosen_label] > 0:
-                            sample_to_assign = indices_by_label_pool[chosen_label].pop() # Get a sample index from the pool.
-                            clients_data_ids[current_client_id].append(sample_to_assign) # Assign to client.
-                            client_classes[current_client_id].add(chosen_label) # Record that client has this label.
-                            samples_left_in_label_pool[chosen_label] -= 1 # Decrement count for that label's pool.
-                            assigned_this_slot = True
-                            break # Slot filled, move to the next slot for this client.
-
-                    if not assigned_this_slot:
-                        # Fallback: If prior-based selection failed (e.g., preferred classes exhausted for this client's prior),
-                        # pick any available label from the group's remaining pool to fill the slot.
-                        available_labels_for_fallback = [
-                            lbl for lbl in lbls_for_group if samples_left_in_label_pool[lbl] > 0
-                        ]
-                        if available_labels_for_fallback:
-                            fallback_label = np.random.choice(available_labels_for_fallback) # Randomly pick from available labels.
-                            sample_to_assign = indices_by_label_pool[fallback_label].pop()
-                            clients_data_ids[current_client_id].append(sample_to_assign)
-                            client_classes[current_client_id].add(fallback_label)
-                            samples_left_in_label_pool[fallback_label] -= 1
-                
-                # If all data for the group is exhausted, no need to process further clients in this group.
-                if sum(samples_left_in_label_pool.values()) == 0:
-                    break 
-    
-    # --- Method 2: Shard-based distribution ("two_shards") ---
-    elif in_session_label_dist == "two_shards":
-        # This loop processes Group A with labels1, then Group B with labels2.
-        for group_idx, (lbls, grp) in enumerate(((labels1, groupA), (labels2, groupB))):
-            M = len(grp) # Number of clients in the current group.
-            # Skip if group is empty, clients aren't configured to take shards, or no labels for this group.
-            if M == 0 or shards_per_client == 0 or not lbls:
                 continue
-            
-            # Total number of shards to be distributed among clients in this group.
-            total_shards_for_group = shards_per_client * M
-            num_labels_for_group = len(lbls) # Number of unique labels assigned to this group.
 
-            if num_labels_for_group == 0: # Should be caught by `not lbls` already.
-                continue 
-            
-            all_shards_created_for_group = [] # List to hold all shards created from all labels in this group.
-            
-            # Only proceed if we are supposed to make any shards at all for this group.
-            if total_shards_for_group > 0:
-                # Calculate nominal number of shards to create per label.
-                shards_per_label_nominal = total_shards_for_group // num_labels_for_group
+            # Determine per-client quotas
+            avg = total_samples_for_group_labels / num_clients_in_grp
+            if unbalanced_sgm > 0:
+                mu = np.log(avg) if avg > 1e-9 else -10
+                raw = np.random.lognormal(mean=mu, sigma=unbalanced_sgm, size=num_clients_in_grp)
+                quotas = ((raw / raw.sum()) * total_samples_for_group_labels).astype(int)
+            else:
+                quotas = np.full(num_clients_in_grp, avg, dtype=int)
 
-                if shards_per_label_nominal >= 1:
-                    # Standard case: create `shards_per_label_nominal` shards for each label.
-                    for lbl_idx, lbl in enumerate(lbls):
-                        idxs_for_label = np.where(targets == lbl)[0] # Get all samples for the current label.
-                        if len(idxs_for_label) == 0: continue # Skip if label has no samples.
-                        np.random.shuffle(idxs_for_label) # Shuffle samples of the current label.
-                        
-                        # Calculate the size of each shard for this specific label.
-                        calculated_shard_size = len(idxs_for_label) // shards_per_label_nominal
-                        
-                        if calculated_shard_size == 0: 
-                            # If a label has too few samples for `shards_per_label_nominal` shards of size > 0,
-                            # but `shards_per_label_nominal` is >=1 (meaning we *should* make shards for this label),
-                            # create one shard with all its (non-empty) samples.
-                            if len(idxs_for_label) > 0:
-                                all_shards_created_for_group.append(idxs_for_label.tolist())
-                            continue # Move to next label.
-                        
-                        # Create `shards_per_label_nominal` shards of `calculated_shard_size`.
-                        current_sample_idx_ptr = 0
-                        shards_made_for_this_label = 0
-                        for _ in range(shards_per_label_nominal):
-                            start_slice = current_sample_idx_ptr
-                            end_slice = start_slice + calculated_shard_size
-                            if end_slice <= len(idxs_for_label): # Check if enough samples remain for a full shard.
-                                shard_content = idxs_for_label[start_slice:end_slice].tolist()
-                                if shard_content: # Ensure shard is not empty.
-                                    all_shards_created_for_group.append(shard_content)
-                                    shards_made_for_this_label +=1
-                                current_sample_idx_ptr = end_slice # Advance pointer.
-                            else: break # Not enough for another full shard from this label; remainder is unused.
-                else: 
-                    # Fallback case: `shards_per_label_nominal` is 0, but `total_shards_for_group` > 0.
-                    # This means num_labels_for_group > total_shards_for_group.
-                    # We need to create `total_shards_for_group` shards in total.
-                    # Iterate through labels (shuffled for fairness) and create one shard 
-                    # (containing all samples for that label) from each until `total_shards_for_group` are made.
-                    shards_created_count = 0
-                    shuffled_lbls_for_group = np.random.permutation(lbls).tolist() # Shuffle labels to pick fairly.
+            diff = total_samples_for_group_labels - quotas.sum()
+            for i in range(abs(diff)):
+                quotas[i % num_clients_in_grp] += np.sign(diff)
+            quotas = np.clip(quotas, 0, None)
 
-                    for lbl_idx, lbl in enumerate(shuffled_lbls_for_group):
-                        if shards_created_count >= total_shards_for_group:
-                            break # Enough shards have been created for the group.
+            # Draw Dirichlet priors
+            client_prior_cumsum_map = {
+                cid: np.cumsum(np.random.dirichlet([dirichlet_alpha] * len(lbls_for_group)))
+                for cid in grp_client_ids
+            }
 
-                        idxs_for_label = np.where(targets == lbl)[0]
-                        if len(idxs_for_label) > 0: # Only create a shard if the label has samples.
-                            all_shards_created_for_group.append(idxs_for_label.tolist()) # Shard contains all samples for this label.
-                            shards_created_count += 1
-            # If total_shards_for_group is 0, all_shards_created_for_group remains empty.
-            
-            # Shuffle all collected shards from all labels in this group before assigning to clients.
-            np.random.shuffle(all_shards_created_for_group) 
-            
-            # Assign up to `shards_per_client` shards to each client in the group.
-            current_shard_idx_ptr = 0
-            for cid in grp: # For each client in the current group.
-                num_shards_assigned_to_client = 0
-                # Assign shards while client needs more and shards are available from the pool.
-                while num_shards_assigned_to_client < shards_per_client and \
-                      current_shard_idx_ptr < len(all_shards_created_for_group):
-                    
-                    shard_to_assign = all_shards_created_for_group[current_shard_idx_ptr]
-                    if shard_to_assign: # Ensure shard is not empty before assigning.
-                        clients_data_ids[cid].extend(shard_to_assign)
-                        # Determine the label of this shard (all samples in a shard have the same original label).
-                        label_of_this_shard = targets[shard_to_assign[0]] 
-                        client_classes[cid].add(label_of_this_shard) # Record label for the client.
-                        num_shards_assigned_to_client += 1
-                    current_shard_idx_ptr += 1 # Move to the next available shard.
+            # Prepare pools
+            indices_by_label_pool = {
+                lbl: list(group_label_indices[lbl]) for lbl in lbls_for_group
+            }
+            for lbl in indices_by_label_pool:
+                np.random.shuffle(indices_by_label_pool[lbl])
+            samples_left_in_label_pool = {
+                lbl: len(indices_by_label_pool[lbl]) for lbl in lbls_for_group
+            }
+
+            # Assign samples to each client
+            for client_idx, current_client_id in enumerate(grp_client_ids):
+                need = quotas[client_idx]
+                if need <= 0:
+                    continue
+                cdf = client_prior_cumsum_map[current_client_id]
+
+                for _ in range(need):
+                    if not any(samples_left_in_label_pool.values()):
+                        break
+                    # sample by prior
+                    for _ in range(len(lbls_for_group) * 3 + 5):
+                        u = np.random.rand()
+                        chosen_label = lbls_for_group[np.argmax(u <= cdf)]
+                        if samples_left_in_label_pool[chosen_label] > 0:
+                            sample_idx = indices_by_label_pool[chosen_label].pop()
+                            clients_data_ids[current_client_id].append(sample_idx)
+                            client_classes[current_client_id].add(chosen_label)
+                            samples_left_in_label_pool[chosen_label] -= 1
+                            break
+                    else:
+                        # fallback to any remaining label
+                        available = [l for l in lbls_for_group if samples_left_in_label_pool[l] > 0]
+                        if not available:
+                            break
+                        lbl = np.random.choice(available)
+                        sample_idx = indices_by_label_pool[lbl].pop()
+                        clients_data_ids[current_client_id].append(sample_idx)
+                        client_classes[current_client_id].add(lbl)
+                        samples_left_in_label_pool[lbl] -= 1
 
     # --- 5. Define Sessions and Training Order ---
-    # Create a list of client groups for each session, alternating between Group A and Group B.
     session_clients = [
-        groupA.copy() if (s % 2 == 0) else groupB.copy() # Group A for even-numbered sessions, Group B for odd.
+        groupA.copy() if (s % 2 == 0) else groupB.copy()
         for s in range(num_sessions)
     ]
-    
-    # Expand the session schedule into a per-round training order.
-    training_order = [] # List of lists, where each inner list is the client IDs for a round.
+    training_order = []
     for s, sess_grp in enumerate(session_clients):
-        # Determine number of rounds for this session (pilot phase or actual phase).
         reps = num_rounds_pilot if s < num_sessions_pilot else num_rounds_actual
-        if sess_grp: # Ensure the session group is not empty.
-            # Add the client group `reps` times to the training order, meaning this group trains for `reps` rounds.
-            training_order += [sess_grp.copy()] * reps
+        training_order += [sess_grp.copy()] * reps
 
     return clients_data_ids, client_classes, session_clients, training_order
 
