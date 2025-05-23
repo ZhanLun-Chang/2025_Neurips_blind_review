@@ -19,7 +19,6 @@ def parse_arguments():
     parser.add_argument('--average', type=int, required=True, help='Flag for average baseline (0 or 1)')
     parser.add_argument('--previous', type=int, required=True, help='Flag for previous baseline (0 or 1)')
     parser.add_argument('--continuous', type=int, required=True, help='Flag for continuous baseline (0 or 1)')
-    parser.add_argument('--recovery', type=int, required=True, help='Flag to measure recovery time (0 or 1)')
 
     # Session and Round parameters
     parser.add_argument('--num_sessions', type=int, required=True, help='total number of sessions')
@@ -45,7 +44,7 @@ def parse_arguments():
     parser.add_argument('--kl_coefficient', type=float, required=True, help='KL Divergence coefficient for continuous')
     parser.add_argument('--acg_beta', type=float, required=True, help='ACG Beta')
     parser.add_argument('--acg_lambda', type=float, required=True, help='ACG Lambda')
-    parser.add_argument('--footprint_num_iteration', type=int, required=True, help='Footprint number of iterations (if applicable)')
+    parser.add_argument('--num_round_grad_cal', type=int, required=True, help='number of communication rounds to calculate the computed gradient')
     parser.add_argument('--similarity', type=str, required=True, help='Similarity measure (e.g., two_norm)')
     parser.add_argument('--similarity_scale', type=float, required=True, help='Similarity scale')
 

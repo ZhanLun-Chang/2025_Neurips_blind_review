@@ -1,9 +1,9 @@
 import json
 import random
 import textwrap
-from fast_adapt_dataloader import get_dataset_dict, PretrainedTokenizerProcessor, dict_to_tuple_collate, custom_collate_fn
+from fast_adapt_dataloader import get_dataset_dict, PretrainedTokenizerProcessor, dict_to_tuple_collate
 
-from fast_adapt_utils import compute_client_weights, test_inference, Client, filter_dataset_by_classes, partition_and_schedule, zero_state_dict_cpu, get_learning_rate_from_config, require_init_lr, require_StepLR_stepsize, require_StepLR_gamma, create_model, calculate_polynomial_decay_lr_schedule, get_init_lr_step_gamma_from_config, calculate_step_lr_schedule, get_lr_schedule_from_config, require_lr_min_ratio, initial_model_construction, run_pilot_stage, maybe_download
+from fast_adapt_utils import compute_client_weights, test_inference, Client, filter_dataset_by_classes, partition_and_schedule, zero_state_dict_cpu, require_init_lr, create_model, calculate_polynomial_decay_lr_schedule, get_lr_schedule_from_config, require_lr_min_ratio, initial_model_construction, run_pilot_stage, maybe_download
 
 from fast_adpat_parser import parse_arguments
 import time
@@ -11,7 +11,6 @@ from matplotlib import pyplot as plt
 import torch
 import numpy as np
 import os
-import copy
 import matplotlib.ticker as mtick
 from datetime import datetime
 import pytz
@@ -20,8 +19,7 @@ from pprint import pprint
 from datasets import load_dataset, Features, ClassLabel, Value
 
 
-
-def main_training_loop(args, client_list, type_testing_dataset_dict, training_order_epoch_task_list, run_identifier, skip_pilot, skip_recovery,  skip_construction, skip_average, continuous_baseline):
+def main_training_loop(args, client_list, type_testing_dataset_dict, training_order_epoch_task_list, run_identifier, skip_pilot,  skip_construction, skip_average, continuous_baseline):
     
     dataset_name = args.dataset_name
 
@@ -132,9 +130,7 @@ def main_training_loop(args, client_list, type_testing_dataset_dict, training_or
             )
 
             alg_global_var_dict = {args.algorithm: zero_state_dict_cpu(global_model)}
-            
-            if not skip_recovery:
-                global_model.load_state_dict(initial_random_global_model)
+
 
         current_lr = lr_list[sync_idx%num_rounds_actual]
 
@@ -524,33 +520,27 @@ if __name__ == "__main__":
     if args.initial:
 
         print("Running initial model construction...") 
-        results_dict["initial"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = False, skip_recovery = True,  skip_construction = False, skip_average = True, continuous_baseline = False)
+        results_dict["initial"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = False, skip_construction = False, skip_average = True, continuous_baseline = False)
         print("Initial model construction finished.")
-
-    if args.recovery:
-        print("Running recovery baseline...") 
-        results_dict["recovery"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True, skip_recovery = False,  skip_construction = True, skip_average = True, continuous_baseline = False)
-        print("Recovery baseline finished.")
 
     if args.average:
         print("Running average baseline...") 
-        results_dict["average"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True, skip_recovery = True,  skip_construction = True, skip_average = False, continuous_baseline = False)
+        results_dict["average"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True,  skip_construction = True, skip_average = False, continuous_baseline = False)
         print("Average baseline finished.")
 
     if args.continuous:
         print("Running continuous baseline...") 
-        results_dict["continuous"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True, skip_recovery = True,  skip_construction = True, skip_average = True, continuous_baseline = True)
+        results_dict["continuous"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True,  skip_construction = True, skip_average = True, continuous_baseline = True)
         print("Continuous baseline finished.")
 
     if args.previous:
         print("Running previous baseline...") 
-        results_dict["previous"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True, skip_recovery = True,  skip_construction = True, skip_average = True, continuous_baseline = False)
+        results_dict["previous"] = main_training_loop(args, client_list, type_testing_dataset_dict, training_order, run_identifier, skip_pilot = True,  skip_construction = True, skip_average = True, continuous_baseline = False)
         print("Previous baseline finished.")
 
     # Define plot styles and labels for each result type
     plot_info = {
         "initial": {"label": "With Initial Point Selection", "marker": "p", "linestyle": "--", "linewidth": 3},
-        "recovery": {"label": "Recovery", "marker": "o", "linestyle": "--", "linewidth": 3},
         "average": {"label": "Avg Baseline", "marker": "o", "linestyle": "--", "linewidth": 3},
         "continuous": {"label": "Continuous", "marker": "o", "linestyle": "--", "linewidth": 3},
         "previous": {"label": "Previous Baseline", "marker": "o", "linestyle": "--", "linewidth": 3}, # Added style for previous
